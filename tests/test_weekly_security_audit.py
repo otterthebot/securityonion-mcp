@@ -45,7 +45,7 @@ def _make_fake_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     return repo, fake_bin, command_log
 
 
-def _install_fake_commands(fake_bin: Path) -> None:
+def _install_fake_commands(fake_bin: Path, *, include_pip_audit: bool = True) -> None:
     _write_executable(
         fake_bin / "git",
         textwrap.dedent(
@@ -93,17 +93,18 @@ def _install_fake_commands(fake_bin: Path) -> None:
         ),
     )
 
-    _write_executable(
-        fake_bin / "pip-audit",
-        textwrap.dedent(
-            """\
-            #!/usr/bin/env bash
-            set -euo pipefail
-            echo "pip-audit $*" >> "${COMMAND_LOG}"
-            exit "${PIP_AUDIT_EXIT:-0}"
-            """
-        ),
-    )
+    if include_pip_audit:
+        _write_executable(
+            fake_bin / "pip-audit",
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                echo "pip-audit $*" >> "${COMMAND_LOG}"
+                exit "${PIP_AUDIT_EXIT:-0}"
+                """
+            ),
+        )
 
     _write_executable(
         fake_bin / "python",
@@ -243,3 +244,40 @@ def test_weekly_audit_fails_when_tests_fail_and_keeps_log(tmp_path: Path) -> Non
     commands = command_log.read_text(encoding="utf-8")
     assert "git -C" in commands and "checkout -b" not in commands
     assert "gh pr create" not in commands
+
+
+def test_weekly_audit_continues_when_dependency_audit_finds_issues(tmp_path: Path) -> None:
+    repo, fake_bin, command_log = _make_fake_repo(tmp_path)
+    _install_fake_commands(fake_bin)
+
+    result = _run_audit_script(
+        repo,
+        fake_bin,
+        command_log,
+        {"PIP_AUDIT_EXIT": "1", "GIT_DIFF_HAS_CHANGES": "0"},
+    )
+
+    assert result.returncode == 0
+    log_text = (repo / "logs" / "weekly_security_audit.log").read_text(encoding="utf-8")
+    assert "WARNING: Dependency audit found issues (see above)." in log_text
+    assert "All tests passed." in log_text
+
+    commands = command_log.read_text(encoding="utf-8")
+    assert "pip-audit -r" in commands
+    assert "python -m pytest" in commands
+
+
+def test_weekly_audit_installs_pip_audit_when_missing(tmp_path: Path) -> None:
+    repo, fake_bin, command_log = _make_fake_repo(tmp_path)
+    _install_fake_commands(fake_bin, include_pip_audit=False)
+
+    result = _run_audit_script(
+        repo,
+        fake_bin,
+        command_log,
+        {"GIT_DIFF_HAS_CHANGES": "0"},
+    )
+
+    assert result.returncode == 0
+    commands = command_log.read_text(encoding="utf-8")
+    assert "pip install pip-audit" in commands
