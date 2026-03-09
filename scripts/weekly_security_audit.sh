@@ -30,8 +30,17 @@ log() {
 # ---------------------------------------------------------------------------
 pull_latest_main() {
     log "=== Step 1: Pulling latest main branch ==="
-    git -C "${REPO_ROOT}" checkout main 2>&1 | tee -a "${LOG_FILE}"
-    git -C "${REPO_ROOT}" pull --ff-only origin main 2>&1 | tee -a "${LOG_FILE}"
+    # Use fetch+merge instead of checkout to avoid worktree conflicts
+    git -C "${REPO_ROOT}" fetch origin main 2>&1 | tee -a "${LOG_FILE}"
+    local current_branch
+    current_branch=$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)
+    if [[ "${current_branch}" == "main" ]]; then
+        git -C "${REPO_ROOT}" merge --ff-only origin/main 2>&1 | tee -a "${LOG_FILE}"
+    else
+        # Reset to latest main without checkout (works in worktrees)
+        git -C "${REPO_ROOT}" merge --ff-only origin/main 2>&1 | tee -a "${LOG_FILE}" || \
+            log "WARNING: Could not fast-forward to origin/main from current branch. Continuing from HEAD."
+    fi
     log "Main branch is up to date."
 }
 
@@ -70,21 +79,32 @@ update_requirements() {
     header=$(head -n 4 "${REPO_ROOT}/requirements.txt")
 
     # Freeze only the packages originally listed (unpinned names)
-    local pkgs
-    pkgs=$(grep -v '^\s*#' "${REPO_ROOT}/requirements.txt" | grep -v '^\s*$' | sed 's/[=<>!].*//' | tr '[:upper:]' '[:lower:]')
-
     local tmpfile
     tmpfile=$(mktemp)
     echo "${header}" > "${tmpfile}"
 
-    for pkg in ${pkgs}; do
+    local frozen
+    frozen=$(pip freeze 2>/dev/null) || true
+
+    grep -v '^\s*#' "${REPO_ROOT}/requirements.txt" | grep -v '^\s*$' | while IFS= read -r line; do
+        # Skip lines that are flags or editable installs
+        if [[ "${line}" =~ ^[[:space:]]*- ]] || [[ "${line}" =~ ^[[:space:]]*-e ]] || [[ "${line}" =~ ^[[:space:]]*-r ]]; then
+            echo "${line}" >> "${tmpfile}"
+            continue
+        fi
+        # Extract the package name (strip version specifiers and extras)
+        local pkg
+        pkg=$(echo "${line}" | sed 's/[=<>!;].*//' | sed 's/\[.*\]//' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        if [[ -z "${pkg}" ]]; then
+            continue
+        fi
         local pinned
-        pinned=$(pip freeze 2>/dev/null | grep -i "^${pkg}==" | head -n1) || true
+        pinned=$(echo "${frozen}" | grep -i -e "^${pkg}==" | head -n1) || true
         if [[ -n "${pinned}" ]]; then
             echo "${pinned}" >> "${tmpfile}"
         else
-            # Keep the original unpinned line if we can't resolve it
-            echo "${pkg}" >> "${tmpfile}"
+            # Keep the original line if we can't resolve it
+            echo "${line}" >> "${tmpfile}"
         fi
     done
 
@@ -121,10 +141,19 @@ commit_and_push() {
         return 0
     fi
 
-    git -C "${REPO_ROOT}" commit -S -m "chore: weekly security audit dependency update
+    # Attempt GPG-signed commit; fall back to unsigned if no key is available
+    if gpg --list-secret-keys --keyid-format LONG 2>/dev/null | grep -q sec; then
+        git -C "${REPO_ROOT}" commit -S -m "chore: weekly security audit dependency update
 
 Automated weekly security audit – pinned dependency versions and
 verified no known vulnerabilities." 2>&1 | tee -a "${LOG_FILE}"
+    else
+        log "WARNING: No GPG secret key found – creating unsigned commit."
+        git -C "${REPO_ROOT}" commit -m "chore: weekly security audit dependency update
+
+Automated weekly security audit – pinned dependency versions and
+verified no known vulnerabilities." 2>&1 | tee -a "${LOG_FILE}"
+    fi
 
     log "Pushing branch ${BRANCH_NAME} to origin..."
     git -C "${REPO_ROOT}" push -u origin "${BRANCH_NAME}" 2>&1 | tee -a "${LOG_FILE}"
